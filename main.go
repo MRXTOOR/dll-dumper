@@ -6,32 +6,29 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/Binject/debug/pe"
+	"github.com/fatih/color"
 )
 
-func getDLLsFromExe(exePath string) ([]string, error) {
+func getDLLsFromExe(exePath string) ([]string, []*pe.Section, error) {
 	file, err := pe.Open(exePath)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer file.Close()
 
-	fmt.Println("DEBUG: Секции файла:")
-	for _, sec := range file.Sections {
-		fmt.Printf("  %s (VA: 0x%X, Size: 0x%X)\n", sec.Name, sec.VirtualAddress, sec.Size)
-	}
+	sections := file.Sections
 
 	importedLibs, err := file.ImportedLibraries()
 	if err != nil {
 		fmt.Println("Ошибка при получении импортируемых библиотек:", err)
-		return nil, err
+		return nil, sections, err
 	}
-	fmt.Println("DEBUG: импортируемые библиотеки:", importedLibs)
-	return importedLibs, nil
+	return importedLibs, sections, nil
 }
-
 
 func getDelayDLLsFromExe(exePath string) ([]string, error) {
 	file, err := pe.Open(exePath)
@@ -211,11 +208,11 @@ func printGroupedDLLs(title string, dlls []string) {
 	if len(dlls) == 0 {
 		return
 	}
-	fmt.Println(title)
+	color.New(color.FgCyan, color.Bold).Println(title)
 	for i, dll := range dlls {
-		fmt.Printf("%d. %s\n", i+1, dll)
+		color.New(color.FgWhite).Printf("%d. %s\n", i+1, dll)
 	}
-	fmt.Println(strings.Repeat("-", 60))
+	color.New(color.FgHiBlack).Println(strings.Repeat("-", 60))
 }
 
 func isApiSetDLL(name string) bool {
@@ -235,9 +232,103 @@ func isSignedDLL(path string) (bool, string) {
 	return false, status // "NotSigned", "UnknownError", "HashMismatch"
 }
 
+func clearScreen() {
+	cmd := exec.Command("cmd", "/c", "cls")
+	cmd.Stdout = os.Stdout
+	cmd.Run()
+}
+
+func interactiveMenu(normalDLLs, apiSetDLLs []string, exePath string, sections []*pe.Section) {
+	reader := bufio.NewReader(os.Stdin)
+	for {
+		color.New(color.FgGreen, color.Bold).Println("\nМеню:")
+		color.New(color.FgYellow).Println("1. Показать все обычные DLL")
+		color.New(color.FgYellow).Println("2. Показать DLL семейства api-ms-*")
+		color.New(color.FgYellow).Println("3. Показать только не подписанные DLL")
+		color.New(color.FgYellow).Println("4. Показать подробную информацию о DLL")
+		color.New(color.FgYellow).Println("5. Показать секции файла")
+		color.New(color.FgRed).Println("0. Выход")
+		color.New(color.FgCyan).Print("Выберите действие: ")
+		choice, _ := reader.ReadString('\n')
+		choice = strings.TrimSpace(choice)
+
+		switch choice {
+		case "1":
+			clearScreen()
+			printGroupedDLLs("Обычные DLL:", normalDLLs)
+		case "2":
+			clearScreen()
+			printGroupedDLLs("DLL семейства api-ms-*:", apiSetDLLs)
+		case "3":
+			clearScreen()
+			color.New(color.FgRed, color.Bold).Println("Не подписанные DLL:")
+			for i, dll := range normalDLLs {
+				dllPath := filepath.Join(filepath.Dir(exePath), dll)
+				if _, err := os.Stat(dllPath); err == nil {
+					signed, _ := isSignedDLL(dllPath)
+					if !signed {
+						color.New(color.FgWhite).Printf("%d. %s\n", i+1, dll)
+					}
+				}
+			}
+			color.New(color.FgHiBlack).Println(strings.Repeat("-", 60))
+		case "4":
+			clearScreen()
+			color.New(color.FgCyan).Print("Введите номер DLL из списка обычных DLL: ")
+			numStr, _ := reader.ReadString('\n')
+			numStr = strings.TrimSpace(numStr)
+			num, err := strconv.Atoi(numStr)
+			if err != nil || num < 1 || num > len(normalDLLs) {
+				color.New(color.FgRed).Println("Некорректный номер.")
+				continue
+			}
+			dll := normalDLLs[num-1]
+			dllPath := filepath.Join(filepath.Dir(exePath), dll)
+			color.New(color.FgMagenta, color.Bold).Printf("Информация о %s:\n", dll)
+			signed, signStatus := isSignedDLL(dllPath)
+			if signed {
+				color.New(color.FgGreen).Println("   [Подписана]")
+			} else {
+				color.New(color.FgRed).Printf("   [Не подписана] (%s)\n", signStatus)
+			}
+			exports, _ := getExportsFromDLL(dllPath)
+			imports, _ := getImportsFromDLL(dllPath)
+			if len(exports) > 0 {
+				color.New(color.FgCyan).Println("   Экспортируемые функции:")
+				for _, exp := range exports {
+					color.New(color.FgWhite).Println("     -", exp)
+				}
+			} else {
+				color.New(color.FgHiBlack).Println("   Экспортируемые функции: (нет)")
+			}
+			if len(imports) > 0 {
+				color.New(color.FgCyan).Println("   Импортируемые функции:")
+				for _, imp := range imports {
+					color.New(color.FgWhite).Println("     -", imp)
+				}
+			} else {
+				color.New(color.FgHiBlack).Println("   Импортируемые функции: (нет)")
+			}
+			color.New(color.FgHiBlack).Println(strings.Repeat("-", 60))
+		case "5":
+			clearScreen()
+			color.New(color.FgYellow, color.Bold).Println("Секции файла:")
+			for _, sec := range sections {
+				color.New(color.FgWhite).Printf("  %s (VA: 0x%X, Size: 0x%X)\n", sec.Name, sec.VirtualAddress, sec.Size)
+			}
+			color.New(color.FgHiBlack).Println(strings.Repeat("-", 60))
+		case "0":
+			color.New(color.FgRed, color.Bold).Println("Выход.")
+			return
+		default:
+			color.New(color.FgRed).Println("Неизвестная команда.")
+		}
+	}
+}
+
 func main() {
 	exePath := promptPath()
-	dlls, err := getDLLsFromExe(exePath)
+	dlls, sections, err := getDLLsFromExe(exePath)
 	if err != nil {
 		fmt.Println("Ошибка при разборе exe:", err)
 		return
@@ -258,45 +349,7 @@ func main() {
 		}
 	}
 
-	fmt.Println("Импортируемые DLL:")
-	printGroupedDLLs("Обычные DLL:", normalDLLs)
-	printGroupedDLLs("DLL семейства api-ms-*:", apiSetDLLs)
-
-	for i, dll := range normalDLLs {
-		fmt.Printf("%d. %s\n", i+1, dll)
-		dllPath := filepath.Join(filepath.Dir(exePath), dll)
-		if _, err := os.Stat(dllPath); err == nil {
-			signed, signStatus := isSignedDLL(dllPath)
-			if signed {
-				fmt.Println("   [Подписана]")
-			} else {
-				fmt.Printf("   [Не подписана] (%s)\n", signStatus)
-			}
-			exports, _ := getExportsFromDLL(dllPath)
-			imports, _ := getImportsFromDLL(dllPath)
-
-			if len(exports) > 0 {
-				fmt.Println("   Экспортируемые функции:")
-				for _, exp := range exports {
-					fmt.Println("     -", exp)
-				}
-			} else {
-				fmt.Println("   Экспортируемые функции: (нет)")
-			}
-
-			if len(imports) > 0 {
-				fmt.Println("   Импортируемые функции:")
-				for _, imp := range imports {
-					fmt.Println("     -", imp)
-				}
-			} else {
-				fmt.Println("   Импортируемые функции: (нет)")
-			}
-		} else {
-			fmt.Println("   (Файл DLL не найден рядом с exe)")
-		}
-		fmt.Println(strings.Repeat("-", 60))
-	}
+	interactiveMenu(normalDLLs, apiSetDLLs, exePath, sections)
 
 	if len(delayDLLs) > 0 {
 		var apiSetDelayDLLs, normalDelayDLLs []string
