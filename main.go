@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -29,6 +30,65 @@ func getDLLsFromExe(exePath string) ([]string, error) {
 	}
 	fmt.Println("DEBUG: импортируемые библиотеки:", importedLibs)
 	return importedLibs, nil
+}
+
+
+func getDelayDLLsFromExe(exePath string) ([]string, error) {
+	file, err := pe.Open(exePath)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	var delayDir *pe.DataDirectory
+	switch oh := file.OptionalHeader.(type) {
+	case *pe.OptionalHeader32:
+		if len(oh.DataDirectory) > pe.IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT {
+			delayDir = &oh.DataDirectory[pe.IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT]
+		}
+	case *pe.OptionalHeader64:
+		if len(oh.DataDirectory) > pe.IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT {
+			delayDir = &oh.DataDirectory[pe.IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT]
+		}
+	default:
+		return nil, fmt.Errorf("unknown optional header type")
+	}
+
+	if delayDir == nil || delayDir.VirtualAddress == 0 || delayDir.Size == 0 {
+		return []string{}, nil // Нет delay-load импортов
+	}
+
+	var dlls []string
+	rva := delayDir.VirtualAddress
+	for {
+		sec := findSection(file, rva)
+		if sec == nil {
+			break
+		}
+		offset := int64(rva - sec.VirtualAddress)
+		entry := make([]byte, 32) // IMAGE_DELAYLOAD_DESCRIPTOR = 32 bytes
+		n, err := sec.ReadAt(entry, offset)
+		if err != nil || n < 32 {
+			break
+		}
+		isZero := true
+		for _, b := range entry {
+			if b != 0 {
+				isZero = false
+				break
+			}
+		}
+		if isZero {
+			break
+		}
+		dllNameRVA := uint32(entry[12]) | uint32(entry[13])<<8 | uint32(entry[14])<<16 | uint32(entry[15])<<24
+		name := readStringAt(file, int(dllNameRVA))
+		if name != "" {
+			dlls = append(dlls, name)
+		}
+		rva += 32
+	}
+	return dlls, nil
 }
 
 func getExportsFromDLL(dllPath string) ([]string, error) {
@@ -147,6 +207,34 @@ func promptPath() string {
 	return strings.TrimSpace(path)
 }
 
+func printGroupedDLLs(title string, dlls []string) {
+	if len(dlls) == 0 {
+		return
+	}
+	fmt.Println(title)
+	for i, dll := range dlls {
+		fmt.Printf("%d. %s\n", i+1, dll)
+	}
+	fmt.Println(strings.Repeat("-", 60))
+}
+
+func isApiSetDLL(name string) bool {
+	return strings.HasPrefix(strings.ToLower(name), "api-ms-")
+}
+
+func isSignedDLL(path string) (bool, string) {
+	cmd := exec.Command("powershell", "-Command", "Get-AuthenticodeSignature -FilePath '"+path+"' | Select-Object -ExpandProperty Status")
+	output, err := cmd.Output()
+	if err != nil {
+		return false, "Ошибка проверки подписи"
+	}
+	status := strings.TrimSpace(string(output))
+	if status == "Valid" {
+		return true, "Подписана"
+	}
+	return false, status // "NotSigned", "UnknownError", "HashMismatch"
+}
+
 func main() {
 	exePath := promptPath()
 	dlls, err := getDLLsFromExe(exePath)
@@ -154,15 +242,36 @@ func main() {
 		fmt.Println("Ошибка при разборе exe:", err)
 		return
 	}
-	if len(dlls) == 0 {
+	delayDLLs, _ := getDelayDLLsFromExe(exePath)
+
+	if len(dlls) == 0 && len(delayDLLs) == 0 {
 		fmt.Println("Импортируемые DLL не найдены.")
 		return
 	}
+
+	var apiSetDLLs, normalDLLs []string
+	for _, dll := range dlls {
+		if isApiSetDLL(dll) {
+			apiSetDLLs = append(apiSetDLLs, dll)
+		} else {
+			normalDLLs = append(normalDLLs, dll)
+		}
+	}
+
 	fmt.Println("Импортируемые DLL:")
-	for i, dll := range dlls {
+	printGroupedDLLs("Обычные DLL:", normalDLLs)
+	printGroupedDLLs("DLL семейства api-ms-*:", apiSetDLLs)
+
+	for i, dll := range normalDLLs {
 		fmt.Printf("%d. %s\n", i+1, dll)
 		dllPath := filepath.Join(filepath.Dir(exePath), dll)
 		if _, err := os.Stat(dllPath); err == nil {
+			signed, signStatus := isSignedDLL(dllPath)
+			if signed {
+				fmt.Println("   [Подписана]")
+			} else {
+				fmt.Printf("   [Не подписана] (%s)\n", signStatus)
+			}
 			exports, _ := getExportsFromDLL(dllPath)
 			imports, _ := getImportsFromDLL(dllPath)
 
@@ -187,5 +296,21 @@ func main() {
 			fmt.Println("   (Файл DLL не найден рядом с exe)")
 		}
 		fmt.Println(strings.Repeat("-", 60))
+	}
+
+	if len(delayDLLs) > 0 {
+		var apiSetDelayDLLs, normalDelayDLLs []string
+		for _, dll := range delayDLLs {
+			if isApiSetDLL(dll) {
+				apiSetDelayDLLs = append(apiSetDelayDLLs, dll)
+			} else {
+				normalDelayDLLs = append(normalDelayDLLs, dll)
+			}
+		}
+		fmt.Println("Delay-load импортируемые DLL:")
+		printGroupedDLLs("Обычные delay-load DLL:", normalDelayDLLs)
+		printGroupedDLLs("Delay-load DLL семейства api-ms-*:", apiSetDelayDLLs)
+	} else {
+		fmt.Println("Delay-load импортируемые DLL не обнаружены.")
 	}
 }
