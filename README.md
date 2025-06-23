@@ -36,6 +36,17 @@
    Введите путь к exe-файлу: C:\Windows\System32\notepad.exe
    ```
 
+## Примеры работы
+
+### Запуск программы
+![Старт программы](assets/start.png)
+
+### Ввод пути к exe-файлу
+![Ввод пути](assets/pathToExe.png)
+
+### Просмотр секций файла
+![Секции файла](assets/sections.png)
+
 ## Зависимости
 
 - [github.com/Binject/debug/pe](https://github.com/Binject/debug)
